@@ -16,6 +16,7 @@ talks to the abstract "DeviceClient" interface.
 
 from abc import ABC, abstractmethod
 import requests
+import time
 
 
 class DeviceClient(ABC):
@@ -57,23 +58,38 @@ class SimulatorDeviceClient(DeviceClient):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def _request(self, method: str, path: str, **kwargs) -> dict:
+    def _request(self, method: str, path: str, max_retries: int = 3, **kwargs) -> dict:
         url = f"{self.base_url}{path}"
-        try:
-            resp = requests.request(method, url, timeout=self.timeout, **kwargs)
-        except requests.exceptions.ConnectionError as e:
-            raise DeviceClientError(f"could not reach device simulator at {url}: {e}")
-        except requests.exceptions.Timeout:
-            raise DeviceClientError(f"device simulator timed out: {url}")
+        last_error = None
 
-        if resp.status_code >= 400:
+        for attempt in range(max_retries + 1):
             try:
-                detail = resp.json().get("error", resp.text)
-            except ValueError:
-                detail = resp.text
-            raise DeviceClientError(detail, status_code=resp.status_code)
+                resp = requests.request(method, url, timeout=self.timeout, **kwargs)
+            except requests.exceptions.ConnectionError as e:
+                last_error = DeviceClientError(f"could not reach device simulator at {url}: {e}")
+            except requests.exceptions.Timeout:
+                last_error = DeviceClientError(f"device simulator timed out: {url}")
+            else:
+                if resp.status_code == 503:
+                    try:
+                        detail = resp.json().get("error", resp.text)
+                    except ValueError:
+                        detail = resp.text
+                    last_error = DeviceClientError(detail, status_code=503)
+                elif resp.status_code >= 400:
+                    try:
+                        detail = resp.json().get("error", resp.text)
+                    except ValueError:
+                        detail = resp.text
+                    raise DeviceClientError(detail, status_code=resp.status_code)
+                else:
+                    return resp.json()
 
-        return resp.json()
+            if attempt < max_retries:
+                wait_time = 0.5 * (2 ** attempt)
+                time.sleep(wait_time)
+
+        raise last_error
 
     def list_devices(self) -> list:
         return self._request("GET", "/devices")
