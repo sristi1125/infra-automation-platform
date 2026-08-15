@@ -13,16 +13,46 @@ changes.
 """
 
 import os
+import threading
+import time
 from flask import Flask, jsonify, request
 from device_client import SimulatorDeviceClient, DeviceClientError
+import jobs
 
 app = Flask(__name__)
+jobs.init_db()
 
 # In Phase 2 this becomes a proper device registry (Postgres). For now,
 # one client pointed at the simulator is enough to prove the pattern.
 device_client = SimulatorDeviceClient(
     base_url=os.environ.get("SIMULATOR_URL", "http://localhost:5001")
 )
+
+
+def poll_firmware_job(job_id, device_id, target_version):
+    """Runs in the background: checks the simulator every half-second
+    until the firmware upgrade it started finishes, then updates our
+    job record with the final result."""
+    jobs.update_job(job_id, status="running")
+    deadline = time.time() + 30
+
+    while time.time() < deadline:
+        try:
+            status = device_client.get_status(device_id)
+        except DeviceClientError as e:
+            jobs.update_job(job_id, status="failed", error=str(e))
+            return
+
+        fw_status = status.get("firmware_status")
+        if fw_status == "done":
+            jobs.update_job(job_id, status="succeeded", result=status)
+            return
+        if fw_status == "failed":
+            jobs.update_job(job_id, status="failed", error="device reported failure", result=status)
+            return
+        time.sleep(0.5)
+
+    jobs.update_job(job_id, status="failed", error="timed out waiting for device")
 
 
 @app.route("/health", methods=["GET"])
@@ -83,12 +113,39 @@ def upgrade_firmware(device_id):
     if not payload or "target_version" not in payload:
         return jsonify({"error": "request body must include 'target_version'"}), 400
 
+    target_version = payload["target_version"]
+
+    if jobs.has_active_job_for_device(device_id):
+        return jsonify({"error": "a job is already in progress for this device"}), 409
+
     try:
-        result = device_client.upgrade_firmware(device_id, payload["target_version"])
+        device_client.upgrade_firmware(device_id, target_version)
     except DeviceClientError as e:
         code = e.status_code if e.status_code in (404, 409) else 502
         return jsonify({"error": str(e)}), code
-    return jsonify(result), 202
+
+    job = jobs.create_job(device_id, "firmware_upgrade", {"target_version": target_version})
+
+    thread = threading.Thread(
+        target=poll_firmware_job, args=(job["id"], device_id, target_version), daemon=True
+    )
+    thread.start()
+
+    return jsonify(job), 202
+
+
+@app.route("/jobs/<job_id>", methods=["GET"])
+def get_job_status(job_id):
+    job = jobs.get_job(job_id)
+    if job is None:
+        return jsonify({"error": f"unknown job '{job_id}'"}), 404
+    return jsonify(job)
+
+
+@app.route("/jobs", methods=["GET"])
+def list_all_jobs():
+    device_id = request.args.get("device_id")
+    return jsonify(jobs.list_jobs(device_id=device_id))
 
 
 if __name__ == "__main__":
