@@ -176,10 +176,26 @@ def get_job_status(job_id):
     return jsonify(job)
 
 
-@app.route("/jobs", methods=["GET"])
-def list_all_jobs():
-    device_id = request.args.get("device_id")
-    return jsonify(jobs.list_jobs(device_id=device_id))
+@app.route("/devices/summary", methods=["GET"])
+def devices_summary():
+    """One-call fleet overview: every device's current status plus its
+    most recent job, if any. This is the kind of endpoint a dashboard
+    would call to render an at-a-glance view of the whole fleet."""
+    try:
+        devices = device_client.list_devices()
+    except DeviceClientError as e:
+        return jsonify({"error": str(e)}), 502
+
+    summary = []
+    for device in devices:
+        device_jobs = jobs.list_jobs(device_id=device["id"])
+        latest_job = device_jobs[0] if device_jobs else None
+        summary.append({
+            "device": device,
+            "latest_job": latest_job,
+        })
+
+    return jsonify(summary)
 
 
 if __name__ == "__main__":
