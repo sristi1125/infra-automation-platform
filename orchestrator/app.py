@@ -97,6 +97,40 @@ def set_device_power(device_id):
     return jsonify(result)
 
 
+@app.route("/devices/batch/power", methods=["POST"])
+def batch_set_power():
+    """Set power on multiple devices at once. Each device is tried
+    independently - one device failing doesn't stop the others, and
+    we report a clear per-device result instead of one big pass/fail."""
+    payload = request.get_json(silent=True)
+    if not payload or "device_ids" not in payload or "power" not in payload:
+        return jsonify({"error": "request body must include 'device_ids' (list) and 'power'"}), 400
+
+    device_ids = payload["device_ids"]
+    power = payload["power"]
+
+    if not isinstance(device_ids, list) or not device_ids:
+        return jsonify({"error": "device_ids must be a non-empty list"}), 400
+    if power not in ("on", "off"):
+        return jsonify({"error": "power must be 'on' or 'off'"}), 400
+
+    results = []
+    for device_id in device_ids:
+        try:
+            result = device_client.set_power(device_id, power)
+            results.append({"device_id": device_id, "success": True, "result": result})
+        except DeviceClientError as e:
+            results.append({"device_id": device_id, "success": False, "error": str(e)})
+
+    succeeded = sum(1 for r in results if r["success"])
+    return jsonify({
+        "total": len(device_ids),
+        "succeeded": succeeded,
+        "failed": len(device_ids) - succeeded,
+        "results": results,
+    })
+
+
 @app.route("/devices/<device_id>/reset", methods=["POST"])
 def reset_device(device_id):
     try:
