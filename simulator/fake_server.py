@@ -136,6 +136,10 @@ def get_status(device_id):
     device = get_device_or_404(device_id)
     if device is None:
         return jsonify({"error": f"unknown device '{device_id}'"}), 404
+
+    if maybe_inject_chaos():
+        return jsonify({"error": "device unreachable (simulated failure)"}), 503
+
     return jsonify(device)
 
 
