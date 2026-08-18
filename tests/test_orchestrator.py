@@ -37,7 +37,6 @@ def run_simulator():
     )
     thread.start()
 
-    # Wait for it to actually be up before running any tests
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
@@ -52,15 +51,18 @@ def run_simulator():
 
 
 @pytest.fixture
-def orchestrator_client(run_simulator):
+def orchestrator_client(run_simulator, tmp_path, monkeypatch):
     """Flask test client for the orchestrator, pointed at the test simulator."""
     os.environ["SIMULATOR_URL"] = SIMULATOR_TEST_URL
 
-    # Import here (after env var is set) so device_client picks up the URL
+    import jobs
+    monkeypatch.setattr(jobs, "DB_PATH", str(tmp_path / "test_jobs.db"))
+    jobs.init_db()
+
     import app as orchestrator_app
     orchestrator_app.device_client.base_url = SIMULATOR_TEST_URL
-
     orchestrator_app.app.config["TESTING"] = True
+
     with orchestrator_app.app.test_client() as client:
         yield client
 
@@ -95,7 +97,6 @@ def test_set_power_through_orchestrator(orchestrator_client):
     assert resp.status_code == 200
     assert resp.get_json()["power"] == "off"
 
-    # put it back
     orchestrator_client.post("/devices/pdu-1/power", json={"power": "on"})
 
 
@@ -115,9 +116,94 @@ def test_firmware_upgrade_through_orchestrator(orchestrator_client):
         "/devices/switch-1/firmware", json={"target_version": "99.0.0"}
     )
     assert resp.status_code == 202
-    assert resp.get_json()["target_version"] == "99.0.0"
+    job = resp.get_json()
+    assert job["params"]["target_version"] == "99.0.0"
+    assert job["device_id"] == "switch-1"
+    assert job["action"] == "firmware_upgrade"
 
 
 def test_firmware_upgrade_missing_field_rejected(orchestrator_client):
     resp = orchestrator_client.post("/devices/switch-1/firmware", json={})
     assert resp.status_code == 400
+
+
+def test_batch_power_all_succeed(orchestrator_client):
+    resp = orchestrator_client.post(
+        "/devices/batch/power",
+        json={"device_ids": ["switch-1", "pdu-1"], "power": "off"},
+    )
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["total"] == 2
+    assert data["succeeded"] == 2
+    assert data["failed"] == 0
+
+    orchestrator_client.post(
+        "/devices/batch/power",
+        json={"device_ids": ["switch-1", "pdu-1"], "power": "on"},
+    )
+
+
+def test_batch_power_partial_failure(orchestrator_client):
+    resp = orchestrator_client.post(
+        "/devices/batch/power",
+        json={"device_ids": ["switch-1", "fake-device-99"], "power": "off"},
+    )
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["total"] == 2
+    assert data["succeeded"] == 1
+    assert data["failed"] == 1
+
+    results_by_device = {r["device_id"]: r for r in data["results"]}
+    assert results_by_device["switch-1"]["success"] is True
+    assert results_by_device["fake-device-99"]["success"] is False
+
+    orchestrator_client.post(
+        "/devices/batch/power", json={"device_ids": ["switch-1"], "power": "on"}
+    )
+
+
+def test_batch_power_missing_fields_rejected(orchestrator_client):
+    resp = orchestrator_client.post("/devices/batch/power", json={"power": "on"})
+    assert resp.status_code == 400
+
+    resp2 = orchestrator_client.post(
+        "/devices/batch/power", json={"device_ids": ["switch-1"]}
+    )
+    assert resp2.status_code == 400
+
+
+def test_batch_power_empty_list_rejected(orchestrator_client):
+    resp = orchestrator_client.post(
+        "/devices/batch/power", json={"device_ids": [], "power": "on"}
+    )
+    assert resp.status_code == 400
+
+
+def test_devices_summary_includes_all_devices(orchestrator_client):
+    resp = orchestrator_client.get("/devices/summary")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    ids = {entry["device"]["id"] for entry in data}
+    assert "switch-1" in ids
+    assert "pdu-1" in ids
+
+
+def test_devices_summary_includes_latest_job(orchestrator_client):
+    orchestrator_client.post(
+        "/devices/switch-1/firmware", json={"target_version": "50.0.0"}
+    )
+
+    resp = orchestrator_client.get("/devices/summary")
+    data = resp.get_json()
+    switch_entry = next(e for e in data if e["device"]["id"] == "switch-1")
+    assert switch_entry["latest_job"] is not None
+    assert switch_entry["latest_job"]["params"]["target_version"] == "50.0.0"
+
+
+def test_devices_summary_no_job_is_null(orchestrator_client):
+    resp = orchestrator_client.get("/devices/summary")
+    data = resp.get_json()
+    pdu_entry = next(e for e in data if e["device"]["id"] == "pdu-1")
+    assert pdu_entry["latest_job"] is None

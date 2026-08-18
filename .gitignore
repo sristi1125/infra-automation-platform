@@ -7,3 +7,4 @@ orchestrator/jobs.db
 orchestrator/firmware.json
 orchestrator/chaos.json
 orchestrator/firmware.json
+jobs.db
