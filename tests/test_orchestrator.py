@@ -51,12 +51,11 @@ def run_simulator():
 
 
 @pytest.fixture
-def orchestrator_client(run_simulator, tmp_path, monkeypatch):
+def orchestrator_client(run_simulator):
     """Flask test client for the orchestrator, pointed at the test simulator."""
     os.environ["SIMULATOR_URL"] = SIMULATOR_TEST_URL
 
     import jobs
-    monkeypatch.setattr(jobs, "DB_PATH", str(tmp_path / "test_jobs.db"))
     jobs.init_db()
 
     import app as orchestrator_app
