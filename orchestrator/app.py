@@ -1,23 +1,28 @@
 """
-ORCHESTRATOR API (Phase 1 skeleton)
+ORCHESTRATOR API
 
-This is the "brain" - the API that will eventually manage real
-infrastructure. Right now it's intentionally simple: it lists devices
-and checks/changes their state by going through the DeviceClient
+This is the "brain" - the API that manages infrastructure. It lists
+devices and checks/changes their state by going through the DeviceClient
 abstraction, which currently points at the simulator.
 
 Nothing in this file talks to fake_server.py directly - it always goes
 through device_client.py. That's the whole point: when real hardware is
 ready, we swap in a new DeviceClient implementation and this file barely
 changes.
+
+Firmware upgrades are handled via a Redis-backed job queue (RQ) instead
+of a background thread - the orchestrator only ever enqueues work here.
+A separate worker process (worker.py) is what actually picks jobs up and
+runs them, which is what lets us scale workers independently of the API.
 """
 
 import os
-import threading
-import time
 from flask import Flask, jsonify, request
 from device_client import SimulatorDeviceClient, DeviceClientError
+from redis import Redis
+from rq import Queue
 import jobs
+from tasks import run_firmware_upgrade_job
 
 app = Flask(__name__)
 jobs.init_db()
@@ -28,31 +33,11 @@ device_client = SimulatorDeviceClient(
     base_url=os.environ.get("SIMULATOR_URL", "http://localhost:5001")
 )
 
-
-def poll_firmware_job(job_id, device_id, target_version):
-    """Runs in the background: checks the simulator every half-second
-    until the firmware upgrade it started finishes, then updates our
-    job record with the final result."""
-    jobs.update_job(job_id, status="running")
-    deadline = time.time() + 30
-
-    while time.time() < deadline:
-        try:
-            status = device_client.get_status(device_id)
-        except DeviceClientError as e:
-            jobs.update_job(job_id, status="failed", error=str(e))
-            return
-
-        fw_status = status.get("firmware_status")
-        if fw_status == "done":
-            jobs.update_job(job_id, status="succeeded", result=status)
-            return
-        if fw_status == "failed":
-            jobs.update_job(job_id, status="failed", error="device reported failure", result=status)
-            return
-        time.sleep(0.5)
-
-    jobs.update_job(job_id, status="failed", error="timed out waiting for device")
+redis_conn = Redis(
+    host=os.environ.get("REDIS_HOST", "localhost"),
+    port=int(os.environ.get("REDIS_PORT", 6379)),
+)
+task_queue = Queue("firmware_upgrades", connection=redis_conn)
 
 
 @app.route("/health", methods=["GET"])
@@ -160,10 +145,9 @@ def upgrade_firmware(device_id):
 
     job = jobs.create_job(device_id, "firmware_upgrade", {"target_version": target_version})
 
-    thread = threading.Thread(
-        target=poll_firmware_job, args=(job["id"], device_id, target_version), daemon=True
-    )
-    thread.start()
+    # Instead of starting our own thread, hand this off to the Redis
+    # queue - a separate worker process will pick it up and run it.
+    task_queue.enqueue(run_firmware_upgrade_job, job["id"], device_id, target_version)
 
     return jsonify(job), 202
 
