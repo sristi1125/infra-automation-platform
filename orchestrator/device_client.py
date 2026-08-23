@@ -16,12 +16,16 @@ talks to the abstract "DeviceClient" interface.
 Every request also goes through a per-device circuit breaker: if a
 device has failed too many times recently, we fail fast instead of
 wasting time retrying a device that's clearly down.
+
+Status reads are also cached briefly in Redis, so repeated calls (like
+a dashboard polling frequently) don't hammer the device every time.
 """
 
 from abc import ABC, abstractmethod
 import requests
 import time
 from circuit_breaker import circuit_breaker
+from cache import get_cached_status, set_cached_status
 
 
 class DeviceClient(ABC):
@@ -118,7 +122,13 @@ class SimulatorDeviceClient(DeviceClient):
         return self._request("GET", "/devices")
 
     def get_status(self, device_id: str) -> dict:
-        return self._request("GET", f"/devices/{device_id}/status", device_id=device_id)
+        cached = get_cached_status(device_id)
+        if cached is not None:
+            return cached
+
+        result = self._request("GET", f"/devices/{device_id}/status", device_id=device_id)
+        set_cached_status(device_id, result)
+        return result
 
     def set_power(self, device_id: str, power: str) -> dict:
         return self._request(
