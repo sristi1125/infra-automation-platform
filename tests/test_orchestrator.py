@@ -50,20 +50,41 @@ def run_simulator():
     yield
 
 
+class AuthedClient:
+    """Thin wrapper around Flask's test client that automatically
+    includes a valid operator API key on every request, so existing
+    tests don't need to be rewritten one by one to add auth headers.
+    Operator key works for both viewer and operator endpoints."""
+
+    def __init__(self, client, api_key="dev-operator-key"):
+        self._client = client
+        self._headers = {"X-API-Key": api_key}
+
+    def get(self, *args, **kwargs):
+        headers = {**self._headers, **kwargs.pop("headers", {})}
+        return self._client.get(*args, headers=headers, **kwargs)
+
+    def post(self, *args, **kwargs):
+        headers = {**self._headers, **kwargs.pop("headers", {})}
+        return self._client.post(*args, headers=headers, **kwargs)
+
+
 @pytest.fixture
 def orchestrator_client(run_simulator):
     """Flask test client for the orchestrator, pointed at the test simulator."""
     os.environ["SIMULATOR_URL"] = SIMULATOR_TEST_URL
 
     import jobs
+    import audit
     jobs.init_db()
+    audit.init_db()
 
     import app as orchestrator_app
     orchestrator_app.device_client.base_url = SIMULATOR_TEST_URL
     orchestrator_app.app.config["TESTING"] = True
 
     with orchestrator_app.app.test_client() as client:
-        yield client
+        yield AuthedClient(client)
 
 
 def test_health(orchestrator_client):
@@ -89,6 +110,23 @@ def test_get_device_status(orchestrator_client):
 def test_get_unknown_device_status_returns_404(orchestrator_client):
     resp = orchestrator_client.get("/devices/nonexistent/status")
     assert resp.status_code == 404
+
+
+def test_missing_api_key_rejected(orchestrator_client):
+    """A request with no API key at all should be rejected with 401,
+    regardless of which endpoint is being called."""
+    resp = orchestrator_client._client.get("/devices")
+    assert resp.status_code == 401
+
+
+def test_viewer_key_cannot_perform_actions(orchestrator_client):
+    """A viewer-role key should be able to read, but not act."""
+    resp = orchestrator_client._client.post(
+        "/devices/switch-1/power",
+        json={"power": "off"},
+        headers={"X-API-Key": "dev-viewer-key"},
+    )
+    assert resp.status_code == 403
 
 
 def test_set_power_through_orchestrator(orchestrator_client):
@@ -212,3 +250,12 @@ def test_devices_summary_latest_job_field_is_present(orchestrator_client):
     for entry in data:
         assert "latest_job" in entry
         assert entry["latest_job"] is None or isinstance(entry["latest_job"], dict)
+
+
+def test_audit_log_records_actions(orchestrator_client):
+    orchestrator_client.post("/devices/pdu-1/reset")
+
+    resp = orchestrator_client.get("/audit-log?device_id=pdu-1")
+    assert resp.status_code == 200
+    entries = resp.get_json()
+    assert any(e["action"] == "reset" and e["device_id"] == "pdu-1" for e in entries)

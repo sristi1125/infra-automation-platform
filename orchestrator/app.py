@@ -14,6 +14,10 @@ Firmware upgrades are handled via a Redis-backed job queue (RQ) instead
 of a background thread - the orchestrator only ever enqueues work here.
 A separate worker process (worker.py) is what actually picks jobs up and
 runs them, which is what lets us scale workers independently of the API.
+
+Every request requires a valid API key (viewer or operator role - see
+auth.py). Actions that change state are also recorded in the audit log
+(see audit.py) - who did what, on which device, and the result.
 """
 
 import os
@@ -22,10 +26,13 @@ from device_client import SimulatorDeviceClient, DeviceClientError
 from redis import Redis
 from rq import Queue
 import jobs
+import audit
+from auth import require_role
 from tasks import run_firmware_upgrade_job
 
 app = Flask(__name__)
 jobs.init_db()
+audit.init_db()
 
 # In Phase 2 this becomes a proper device registry (Postgres). For now,
 # one client pointed at the simulator is enough to prove the pattern.
@@ -46,6 +53,7 @@ def health():
 
 
 @app.route("/devices", methods=["GET"])
+@require_role("viewer")
 def list_devices():
     try:
         devices = device_client.list_devices()
@@ -55,6 +63,7 @@ def list_devices():
 
 
 @app.route("/devices/<device_id>/status", methods=["GET"])
+@require_role("viewer")
 def get_device_status(device_id):
     try:
         status = device_client.get_status(device_id)
@@ -65,6 +74,7 @@ def get_device_status(device_id):
 
 
 @app.route("/devices/<device_id>/power", methods=["POST"])
+@require_role("operator")
 def set_device_power(device_id):
     payload = request.get_json(silent=True)
     if not payload or "power" not in payload:
@@ -77,12 +87,16 @@ def set_device_power(device_id):
     try:
         result = device_client.set_power(device_id, power)
     except DeviceClientError as e:
+        audit.log_action(request.actor, "set_power", device_id, {"power": power}, result="failed")
         code = e.status_code if e.status_code in (404,) else 502
         return jsonify({"error": str(e)}), code
+
+    audit.log_action(request.actor, "set_power", device_id, {"power": power}, result="success")
     return jsonify(result)
 
 
 @app.route("/devices/batch/power", methods=["POST"])
+@require_role("operator")
 def batch_set_power():
     """Set power on multiple devices at once. Each device is tried
     independently - one device failing doesn't stop the others, and
@@ -104,8 +118,10 @@ def batch_set_power():
         try:
             result = device_client.set_power(device_id, power)
             results.append({"device_id": device_id, "success": True, "result": result})
+            audit.log_action(request.actor, "set_power", device_id, {"power": power}, result="success")
         except DeviceClientError as e:
             results.append({"device_id": device_id, "success": False, "error": str(e)})
+            audit.log_action(request.actor, "set_power", device_id, {"power": power}, result="failed")
 
     succeeded = sum(1 for r in results if r["success"])
     return jsonify({
@@ -117,16 +133,21 @@ def batch_set_power():
 
 
 @app.route("/devices/<device_id>/reset", methods=["POST"])
+@require_role("operator")
 def reset_device(device_id):
     try:
         result = device_client.reset(device_id)
     except DeviceClientError as e:
+        audit.log_action(request.actor, "reset", device_id, result="failed")
         code = e.status_code if e.status_code in (404,) else 502
         return jsonify({"error": str(e)}), code
+
+    audit.log_action(request.actor, "reset", device_id, result="success")
     return jsonify(result)
 
 
 @app.route("/devices/<device_id>/firmware", methods=["POST"])
+@require_role("operator")
 def upgrade_firmware(device_id):
     payload = request.get_json(silent=True)
     if not payload or "target_version" not in payload:
@@ -140,10 +161,12 @@ def upgrade_firmware(device_id):
     try:
         device_client.upgrade_firmware(device_id, target_version)
     except DeviceClientError as e:
+        audit.log_action(request.actor, "firmware_upgrade", device_id, {"target_version": target_version}, result="failed")
         code = e.status_code if e.status_code in (404, 409) else 502
         return jsonify({"error": str(e)}), code
 
     job = jobs.create_job(device_id, "firmware_upgrade", {"target_version": target_version})
+    audit.log_action(request.actor, "firmware_upgrade", device_id, {"target_version": target_version, "job_id": job["id"]}, result="started")
 
     # Instead of starting our own thread, hand this off to the Redis
     # queue - a separate worker process will pick it up and run it.
@@ -153,6 +176,7 @@ def upgrade_firmware(device_id):
 
 
 @app.route("/jobs/<job_id>", methods=["GET"])
+@require_role("viewer")
 def get_job_status(job_id):
     job = jobs.get_job(job_id)
     if job is None:
@@ -161,6 +185,7 @@ def get_job_status(job_id):
 
 
 @app.route("/devices/summary", methods=["GET"])
+@require_role("viewer")
 def devices_summary():
     """One-call fleet overview: every device's current status plus its
     most recent job, if any. This is the kind of endpoint a dashboard
@@ -180,6 +205,13 @@ def devices_summary():
         })
 
     return jsonify(summary)
+
+
+@app.route("/audit-log", methods=["GET"])
+@require_role("viewer")
+def get_audit_log():
+    device_id = request.args.get("device_id")
+    return jsonify(audit.list_entries(device_id=device_id))
 
 
 if __name__ == "__main__":
