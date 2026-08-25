@@ -190,15 +190,16 @@ def test_devices_summary_includes_all_devices(orchestrator_client):
 
 
 def test_devices_summary_includes_latest_job(orchestrator_client):
-    orchestrator_client.post(
-        "/devices/switch-1/firmware", json={"target_version": "50.0.0"}
+    resp1 = orchestrator_client.post(
+        "/devices/pdu-1/firmware", json={"target_version": "50.0.0"}
     )
+    assert resp1.status_code == 202
 
     resp = orchestrator_client.get("/devices/summary")
     data = resp.get_json()
-    switch_entry = next(e for e in data if e["device"]["id"] == "switch-1")
-    assert switch_entry["latest_job"] is not None
-    assert switch_entry["latest_job"]["params"]["target_version"] == "50.0.0"
+    pdu_entry = next(e for e in data if e["device"]["id"] == "pdu-1")
+    assert pdu_entry["latest_job"] is not None
+    assert pdu_entry["latest_job"]["params"]["target_version"] == "50.0.0"
 
 
 def test_devices_summary_latest_job_field_is_present(orchestrator_client):

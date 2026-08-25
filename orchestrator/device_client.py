@@ -13,12 +13,10 @@ using whatever protocol it needs (SSH, SNMP, a vendor API, etc) - and the
 orchestrator's logic wouldn't need to change at all, because it only ever
 talks to the abstract "DeviceClient" interface.
 
-Every request also goes through a per-device circuit breaker: if a
-device has failed too many times recently, we fail fast instead of
-wasting time retrying a device that's clearly down.
-
-Status reads are also cached briefly in Redis, so repeated calls (like
-a dashboard polling frequently) don't hammer the device every time.
+Every request goes through, in order: a rate limiter (protects against
+too many requests too quickly), a circuit breaker (fails fast if a
+device has been consistently failing), then the actual HTTP call with
+retries. Status reads are also cached briefly in Redis.
 """
 
 from abc import ABC, abstractmethod
@@ -26,6 +24,7 @@ import requests
 import time
 from circuit_breaker import circuit_breaker
 from cache import get_cached_status, set_cached_status
+from rate_limiter import allow_request as rate_limiter_allow
 
 
 class DeviceClient(ABC):
@@ -66,6 +65,12 @@ class CircuitOpenError(DeviceClientError):
         super().__init__(f"circuit open for device '{device_id}' - too many recent failures", status_code=503)
 
 
+class RateLimitedError(DeviceClientError):
+    """Raised when a device's rate limit has been exceeded."""
+    def __init__(self, device_id):
+        super().__init__(f"rate limit exceeded for device '{device_id}' - slow down", status_code=429)
+
+
 class SimulatorDeviceClient(DeviceClient):
     """Talks to fake_server.py over HTTP. This stands in for a real
     device driver until real hardware is available."""
@@ -75,6 +80,9 @@ class SimulatorDeviceClient(DeviceClient):
         self.timeout = timeout
 
     def _request(self, method: str, path: str, device_id: str = None, max_retries: int = 3, **kwargs) -> dict:
+        if device_id and not rate_limiter_allow(device_id):
+            raise RateLimitedError(device_id)
+
         # If this call is tied to a specific device, check the circuit
         # breaker before even attempting anything.
         if device_id and not circuit_breaker.allow_request(device_id):
