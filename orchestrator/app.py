@@ -18,10 +18,15 @@ runs them, which is what lets us scale workers independently of the API.
 Every request requires a valid API key (viewer or operator role - see
 auth.py). Actions that change state are also recorded in the audit log
 (see audit.py) - who did what, on which device, and the result.
+
+CORS is enabled specifically for the dashboard's dev server
+(localhost:5173), so the browser allows the React app to call this API
+even though they run on different ports.
 """
 
 import os
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from device_client import SimulatorDeviceClient, DeviceClientError
 from redis import Redis
 from rq import Queue
@@ -31,6 +36,7 @@ from auth import require_role
 from tasks import run_firmware_upgrade_job
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
 jobs.init_db()
 audit.init_db()
 
