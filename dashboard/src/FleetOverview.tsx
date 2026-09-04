@@ -67,7 +67,12 @@ function FleetOverview() {
   return (
     <div className="app">
       <header className="page-header">
-        <h1>Fleet Overview</h1>
+        <div className="header-top">
+          <h1>Fleet Overview</h1>
+          <button className="link-button" onClick={() => navigate("/audit-log")}>
+            View Audit Log →
+          </button>
+        </div>
         <p className="subtitle">{devices.length} devices</p>
       </header>
 
