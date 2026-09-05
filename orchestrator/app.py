@@ -15,9 +15,11 @@ of a background thread - the orchestrator only ever enqueues work here.
 A separate worker process (worker.py) is what actually picks jobs up and
 runs them, which is what lets us scale workers independently of the API.
 
-Every request requires a valid API key (viewer or operator role - see
-auth.py). Actions that change state are also recorded in the audit log
-(see audit.py) - who did what, on which device, and the result.
+Every request requires a valid API key OR session token (viewer or
+operator role - see auth.py). The /login endpoint issues session tokens
+after checking a username/password, so the dashboard never has to store
+permanent API keys. Actions that change state are also recorded in the
+audit log (see audit.py) - who did what, on which device, and the result.
 
 CORS is enabled specifically for the dashboard's dev server
 (localhost:5173), so the browser allows the React app to call this API
@@ -56,6 +58,27 @@ task_queue = Queue("firmware_upgrades", connection=redis_conn)
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "orchestrator"})
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    """Validates username/password and issues a short-lived session
+    token. This is what the dashboard uses instead of exposing the
+    permanent API keys to the browser."""
+    payload = request.get_json(silent=True)
+    if not payload or "username" not in payload or "password" not in payload:
+        return jsonify({"error": "request body must include 'username' and 'password'"}), 400
+
+    username = payload["username"]
+    password = payload["password"]
+
+    from auth import USERS, create_session
+    user = USERS.get(username)
+    if user is None or user["password"] != password:
+        return jsonify({"error": "invalid username or password"}), 401
+
+    token = create_session(redis_conn, username, user["role"])
+    return jsonify({"token": token, "role": user["role"], "username": username})
 
 
 @app.route("/devices", methods=["GET"])
