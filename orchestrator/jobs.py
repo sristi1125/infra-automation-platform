@@ -16,7 +16,7 @@ import uuid
 import json
 import psycopg2
 import psycopg2.extras
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
 DB_CONFIG = {
@@ -26,6 +26,14 @@ DB_CONFIG = {
     "user": os.environ.get("POSTGRES_USER", "infra"),
     "password": os.environ.get("POSTGRES_PASSWORD", "infra_dev_password"),
 }
+
+# How long a job may sit in an active state before we assume whoever
+# owned it is gone. A worker gives up on a device after 30s (tasks.py),
+# so a job still 'running' after 120s means the worker died mid-job.
+# A job still 'pending' after 600s was never picked up (no worker
+# running, or the enqueue to Redis failed after the row was written).
+STALE_RUNNING_SECONDS = int(os.environ.get("STALE_RUNNING_SECONDS", 120))
+STALE_PENDING_SECONDS = int(os.environ.get("STALE_PENDING_SECONDS", 600))
 
 
 def init_db():
@@ -109,7 +117,41 @@ def list_jobs(device_id=None):
             return [_row_to_dict(r) for r in rows]
 
 
+def fail_stale_jobs(device_id=None):
+    """Mark abandoned 'pending'/'running' jobs as failed so they stop
+    blocking their device forever. Returns the ids of jobs it failed.
+
+    Without this, a worker crash (or a job that never reached a worker)
+    leaves the device permanently rejecting new jobs with 409."""
+    now = _now()
+    running_cutoff = now - timedelta(seconds=STALE_RUNNING_SECONDS)
+    pending_cutoff = now - timedelta(seconds=STALE_PENDING_SECONDS)
+    query = """
+        UPDATE jobs
+        SET status = 'failed',
+            error = CASE status
+                WHEN 'running' THEN 'abandoned: worker stopped reporting progress (likely crashed)'
+                ELSE 'abandoned: never picked up by a worker'
+            END,
+            updated_at = %s
+        WHERE ((status = 'running' AND updated_at < %s)
+            OR (status = 'pending' AND updated_at < %s))
+    """
+    params = [now, running_cutoff, pending_cutoff]
+    if device_id is not None:
+        query += " AND device_id = %s"
+        params.append(device_id)
+    query += " RETURNING id"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            ids = [row[0] for row in cur.fetchall()]
+        conn.commit()
+    return ids
+
+
 def has_active_job_for_device(device_id):
+    fail_stale_jobs(device_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(

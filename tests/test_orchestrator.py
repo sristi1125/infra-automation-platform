@@ -255,3 +255,90 @@ def test_audit_log_records_actions(orchestrator_client):
     assert resp.status_code == 200
     entries = resp.get_json()
     assert any(e["action"] == "reset" and e["device_id"] == "pdu-1" for e in entries)
+
+# --- Abandoned job recovery -------------------------------------------------
+# A worker that crashes mid-job (or a job that never reaches a worker)
+# used to leave the device rejecting every new job with 409 forever.
+
+
+def _wait_until_simulator_idle(device_id, timeout=15):
+    """Simulator state is shared across tests, and an earlier test may
+    have left this device mid-upgrade (the simulator itself returns 409
+    then). Wait it out so we only exercise the orchestrator's own checks."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = requests.get(f"{SIMULATOR_TEST_URL}/devices/{device_id}/status", timeout=2).json()
+        if status["firmware_status"] not in ("updating", "verifying"):
+            return
+        time.sleep(0.2)
+    pytest.fail(f"simulator device {device_id} stayed mid-upgrade")
+
+
+def _insert_job(device_id, status, age_seconds):
+    """Insert a job directly with a backdated updated_at, simulating a
+    job whose worker has gone away."""
+    import jobs
+    job = jobs.create_job(device_id, "firmware_upgrade", {"target_version": "1.0.0"})
+    with jobs.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET status = %s, updated_at = NOW() - make_interval(secs => %s) WHERE id = %s",
+                (status, age_seconds, job["id"]),
+            )
+        conn.commit()
+    return job["id"]
+
+
+def test_duplicate_firmware_job_rejected(orchestrator_client):
+    _wait_until_simulator_idle("switch-1")
+    resp1 = orchestrator_client.post("/devices/switch-1/firmware", json={"target_version": "2.0.0"})
+    assert resp1.status_code == 202
+    resp2 = orchestrator_client.post("/devices/switch-1/firmware", json={"target_version": "2.0.0"})
+    assert resp2.status_code == 409
+    assert "already in progress for this device" in resp2.get_json()["error"]
+
+
+def test_fresh_running_job_still_blocks(orchestrator_client):
+    import jobs
+    job_id = _insert_job("switch-1", "running", age_seconds=5)
+    assert jobs.has_active_job_for_device("switch-1")
+    assert jobs.get_job(job_id)["status"] == "running"
+
+
+def test_abandoned_running_job_is_failed_and_unblocks_device(orchestrator_client):
+    import jobs
+    _wait_until_simulator_idle("switch-1")
+    job_id = _insert_job("switch-1", "running", age_seconds=jobs.STALE_RUNNING_SECONDS + 10)
+
+    resp = orchestrator_client.post("/devices/switch-1/firmware", json={"target_version": "3.0.0"})
+    assert resp.status_code == 202
+
+    stale = jobs.get_job(job_id)
+    assert stale["status"] == "failed"
+    assert "crashed" in stale["error"]
+
+
+def test_never_picked_up_pending_job_is_failed(orchestrator_client):
+    import jobs
+    job_id = _insert_job("pdu-1", "pending", age_seconds=jobs.STALE_PENDING_SECONDS + 10)
+    assert not jobs.has_active_job_for_device("pdu-1")
+    stale = jobs.get_job(job_id)
+    assert stale["status"] == "failed"
+    assert "never picked up" in stale["error"]
+
+
+def test_pending_job_younger_than_pending_timeout_not_reaped(orchestrator_client):
+    """Pending gets a longer grace period than running: a job can wait
+    in the queue behind others, so 'old for running' isn't 'old for pending'."""
+    import jobs
+    job_id = _insert_job("pdu-1", "pending", age_seconds=jobs.STALE_RUNNING_SECONDS + 10)
+    assert jobs.has_active_job_for_device("pdu-1")
+    assert jobs.get_job(job_id)["status"] == "pending"
+
+
+def test_fail_stale_jobs_only_touches_requested_device(orchestrator_client):
+    import jobs
+    other = _insert_job("pdu-1", "running", age_seconds=jobs.STALE_RUNNING_SECONDS + 10)
+    jobs.fail_stale_jobs("switch-1")
+    assert jobs.get_job(other)["status"] == "running"
+    assert jobs.fail_stale_jobs() == [other]
