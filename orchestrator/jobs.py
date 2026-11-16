@@ -15,6 +15,7 @@ import os
 import uuid
 import json
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -52,7 +53,33 @@ def init_db():
                     updated_at TIMESTAMPTZ NOT NULL
                 )
             """)
+            # Older databases may already hold several active jobs for one
+            # device (from before this guard existed). Keep the newest and
+            # fail the rest, or the unique index below can't be built.
+            cur.execute("""
+                UPDATE jobs SET status = 'failed',
+                       error = 'superseded: another active job existed for this device',
+                       updated_at = NOW()
+                WHERE status IN ('pending', 'running')
+                  AND id NOT IN (
+                      SELECT DISTINCT ON (device_id) id FROM jobs
+                      WHERE status IN ('pending', 'running')
+                      ORDER BY device_id, created_at DESC
+                  )
+            """)
+            # The real concurrency guard: Postgres itself refuses a second
+            # pending/running job for the same device, so two simultaneous
+            # requests can't both get through the "already in progress"
+            # check, even across multiple API instances.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_device
+                ON jobs (device_id) WHERE status IN ('pending', 'running')
+            """)
         conn.commit()
+
+
+class ActiveJobExists(Exception):
+    """Raised by create_job when the device already has an active job."""
 
 
 @contextmanager
@@ -73,13 +100,26 @@ def create_job(device_id, action, params=None):
     now = _now()
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO jobs (id, device_id, action, status, params, result, error, created_at, updated_at)
-                   VALUES (%s, %s, %s, 'pending', %s, NULL, NULL, %s, %s)""",
-                (job_id, device_id, action, json.dumps(params or {}), now, now),
-            )
+            try:
+                cur.execute(
+                    """INSERT INTO jobs (id, device_id, action, status, params, result, error, created_at, updated_at)
+                       VALUES (%s, %s, %s, 'pending', %s, NULL, NULL, %s, %s)""",
+                    (job_id, device_id, action, json.dumps(params or {}), now, now),
+                )
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise ActiveJobExists(device_id)
         conn.commit()
     return get_job(job_id)
+
+
+def delete_job(job_id):
+    """Release a claim for a job that never actually started (e.g. the
+    device rejected the command), so it doesn't clutter job history."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+        conn.commit()
 
 
 def update_job(job_id, status, result=None, error=None):

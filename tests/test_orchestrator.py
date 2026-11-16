@@ -342,3 +342,86 @@ def test_fail_stale_jobs_only_touches_requested_device(orchestrator_client):
     jobs.fail_stale_jobs("switch-1")
     assert jobs.get_job(other)["status"] == "running"
     assert jobs.fail_stale_jobs() == [other]
+
+
+# --- One active job per device, enforced by the database --------------------
+
+
+def test_concurrent_job_creation_only_one_wins(orchestrator_client):
+    """Many threads try to start a job on the same device at the same
+    instant. The unique index must let exactly one through."""
+    import jobs
+    barrier = threading.Barrier(10)
+    results = []
+
+    def attempt():
+        barrier.wait()
+        try:
+            jobs.create_job("switch-1", "firmware_upgrade", {"target_version": "4.0.0"})
+            results.append("ok")
+        except jobs.ActiveJobExists:
+            results.append("conflict")
+
+    threads = [threading.Thread(target=attempt) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count("ok") == 1
+    assert results.count("conflict") == 9
+
+
+def test_finished_job_does_not_block_next_one(orchestrator_client):
+    import jobs
+    first = jobs.create_job("pdu-1", "firmware_upgrade", {})
+    jobs.update_job(first["id"], status="succeeded")
+    jobs.create_job("pdu-1", "firmware_upgrade", {})  # must not raise
+
+
+def test_rejected_upgrade_releases_device_claim(orchestrator_client):
+    """If the device refuses the upgrade, the claimed job row is removed,
+    so it neither blocks the device nor shows up as job history."""
+    import jobs
+    resp = orchestrator_client.post("/devices/nonexistent/firmware", json={"target_version": "1.0.0"})
+    assert resp.status_code == 404
+    assert jobs.list_jobs("nonexistent") == []
+
+
+def test_enqueue_failure_marks_job_failed(orchestrator_client, monkeypatch):
+    import app as orchestrator_app
+    import jobs
+    _wait_until_simulator_idle("pdu-1")
+
+    def broken_enqueue(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(orchestrator_app.task_queue, "enqueue", broken_enqueue)
+    resp = orchestrator_client.post("/devices/pdu-1/firmware", json={"target_version": "5.0.0"})
+    assert resp.status_code == 503
+
+    [job] = jobs.list_jobs("pdu-1")
+    assert job["status"] == "failed"
+    assert "could not enqueue" in job["error"]
+    assert not jobs.has_active_job_for_device("pdu-1")
+
+
+def test_init_db_resolves_preexisting_duplicate_active_jobs(orchestrator_client):
+    """Databases from before the unique index can hold several active jobs
+    for one device; init_db must clean them up rather than crash."""
+    import jobs
+    with jobs.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP INDEX jobs_one_active_per_device")
+            cur.execute("""
+                INSERT INTO jobs VALUES
+                ('old', 'switch-1', 'firmware_upgrade', 'pending', '{}', NULL, NULL, NOW() - interval '1 min', NOW()),
+                ('new', 'switch-1', 'firmware_upgrade', 'pending', '{}', NULL, NULL, NOW(), NOW())
+            """)
+        conn.commit()
+
+    jobs.init_db()
+
+    assert jobs.get_job("new")["status"] == "pending"
+    assert jobs.get_job("old")["status"] == "failed"
+    assert "superseded" in jobs.get_job("old")["error"]

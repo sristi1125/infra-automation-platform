@@ -185,23 +185,40 @@ def upgrade_firmware(device_id):
 
     target_version = payload["target_version"]
 
+    busy = jsonify({"error": "a job is already in progress for this device"}), 409
+
+    # Cheap early exit (also clears out jobs abandoned by dead workers).
     if jobs.has_active_job_for_device(device_id):
-        return jsonify({"error": "a job is already in progress for this device"}), 409
+        return busy
+
+    # Claim the device by writing the job row BEFORE touching the device.
+    # A unique index allows only one active job per device, so if two
+    # requests race past the check above, exactly one insert wins.
+    try:
+        job = jobs.create_job(device_id, "firmware_upgrade", {"target_version": target_version})
+    except jobs.ActiveJobExists:
+        return busy
 
     try:
         device_client.upgrade_firmware(device_id, target_version)
     except DeviceClientError as e:
+        jobs.delete_job(job["id"])  # never started - release the claim
         audit.log_action(request.actor, "firmware_upgrade", device_id, {"target_version": target_version}, result="failed")
         code = e.status_code if e.status_code in (404, 409) else 502
         return jsonify({"error": str(e)}), code
 
-    job = jobs.create_job(device_id, "firmware_upgrade", {"target_version": target_version})
-    audit.log_action(request.actor, "firmware_upgrade", device_id, {"target_version": target_version, "job_id": job["id"]}, result="started")
-
     # Instead of starting our own thread, hand this off to the Redis
     # queue - a separate worker process will pick it up and run it.
-    task_queue.enqueue(run_firmware_upgrade_job, job["id"], device_id, target_version)
+    try:
+        task_queue.enqueue(run_firmware_upgrade_job, job["id"], device_id, target_version)
+    except Exception as e:
+        # The device is upgrading but nothing will track it; record that
+        # rather than leaving a 'pending' job no worker will ever see.
+        jobs.update_job(job["id"], status="failed", error=f"could not enqueue job: {e}")
+        audit.log_action(request.actor, "firmware_upgrade", device_id, {"target_version": target_version, "job_id": job["id"]}, result="failed")
+        return jsonify({"error": "job queue unavailable"}), 503
 
+    audit.log_action(request.actor, "firmware_upgrade", device_id, {"target_version": target_version, "job_id": job["id"]}, result="started")
     return jsonify(job), 202
 
 
