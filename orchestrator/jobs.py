@@ -15,8 +15,9 @@ import os
 import uuid
 import json
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
 DB_CONFIG = {
@@ -26,6 +27,14 @@ DB_CONFIG = {
     "user": os.environ.get("POSTGRES_USER", "infra"),
     "password": os.environ.get("POSTGRES_PASSWORD", "infra_dev_password"),
 }
+
+# How long a job may sit in an active state before we assume whoever
+# owned it is gone. A worker gives up on a device after 30s (tasks.py),
+# so a job still 'running' after 120s means the worker died mid-job.
+# A job still 'pending' after 600s was never picked up (no worker
+# running, or the enqueue to Redis failed after the row was written).
+STALE_RUNNING_SECONDS = int(os.environ.get("STALE_RUNNING_SECONDS", 120))
+STALE_PENDING_SECONDS = int(os.environ.get("STALE_PENDING_SECONDS", 600))
 
 
 def init_db():
@@ -44,7 +53,33 @@ def init_db():
                     updated_at TIMESTAMPTZ NOT NULL
                 )
             """)
+            # Older databases may already hold several active jobs for one
+            # device (from before this guard existed). Keep the newest and
+            # fail the rest, or the unique index below can't be built.
+            cur.execute("""
+                UPDATE jobs SET status = 'failed',
+                       error = 'superseded: another active job existed for this device',
+                       updated_at = NOW()
+                WHERE status IN ('pending', 'running')
+                  AND id NOT IN (
+                      SELECT DISTINCT ON (device_id) id FROM jobs
+                      WHERE status IN ('pending', 'running')
+                      ORDER BY device_id, created_at DESC
+                  )
+            """)
+            # The real concurrency guard: Postgres itself refuses a second
+            # pending/running job for the same device, so two simultaneous
+            # requests can't both get through the "already in progress"
+            # check, even across multiple API instances.
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_device
+                ON jobs (device_id) WHERE status IN ('pending', 'running')
+            """)
         conn.commit()
+
+
+class ActiveJobExists(Exception):
+    """Raised by create_job when the device already has an active job."""
 
 
 @contextmanager
@@ -65,13 +100,26 @@ def create_job(device_id, action, params=None):
     now = _now()
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO jobs (id, device_id, action, status, params, result, error, created_at, updated_at)
-                   VALUES (%s, %s, %s, 'pending', %s, NULL, NULL, %s, %s)""",
-                (job_id, device_id, action, json.dumps(params or {}), now, now),
-            )
+            try:
+                cur.execute(
+                    """INSERT INTO jobs (id, device_id, action, status, params, result, error, created_at, updated_at)
+                       VALUES (%s, %s, %s, 'pending', %s, NULL, NULL, %s, %s)""",
+                    (job_id, device_id, action, json.dumps(params or {}), now, now),
+                )
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise ActiveJobExists(device_id)
         conn.commit()
     return get_job(job_id)
+
+
+def delete_job(job_id):
+    """Release a claim for a job that never actually started (e.g. the
+    device rejected the command), so it doesn't clutter job history."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+        conn.commit()
 
 
 def update_job(job_id, status, result=None, error=None):
@@ -109,7 +157,41 @@ def list_jobs(device_id=None):
             return [_row_to_dict(r) for r in rows]
 
 
+def fail_stale_jobs(device_id=None):
+    """Mark abandoned 'pending'/'running' jobs as failed so they stop
+    blocking their device forever. Returns the ids of jobs it failed.
+
+    Without this, a worker crash (or a job that never reached a worker)
+    leaves the device permanently rejecting new jobs with 409."""
+    now = _now()
+    running_cutoff = now - timedelta(seconds=STALE_RUNNING_SECONDS)
+    pending_cutoff = now - timedelta(seconds=STALE_PENDING_SECONDS)
+    query = """
+        UPDATE jobs
+        SET status = 'failed',
+            error = CASE status
+                WHEN 'running' THEN 'abandoned: worker stopped reporting progress (likely crashed)'
+                ELSE 'abandoned: never picked up by a worker'
+            END,
+            updated_at = %s
+        WHERE ((status = 'running' AND updated_at < %s)
+            OR (status = 'pending' AND updated_at < %s))
+    """
+    params = [now, running_cutoff, pending_cutoff]
+    if device_id is not None:
+        query += " AND device_id = %s"
+        params.append(device_id)
+    query += " RETURNING id"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            ids = [row[0] for row in cur.fetchall()]
+        conn.commit()
+    return ids
+
+
 def has_active_job_for_device(device_id):
+    fail_stale_jobs(device_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(

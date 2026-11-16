@@ -23,12 +23,22 @@ import os
 from redis import Redis
 from rq import SimpleWorker, Queue
 
+import jobs
+
 redis_conn = Redis(
     host=os.environ.get("REDIS_HOST", "localhost"),
     port=int(os.environ.get("REDIS_PORT", 6379)),
+    db=int(os.environ.get("REDIS_DB", 0)),
 )
 
 if __name__ == "__main__":
+    # If a previous worker crashed mid-job, its jobs are still marked
+    # 'running'. Clear out any that are past the stale threshold so
+    # their devices accept new work again.
+    reaped = jobs.fail_stale_jobs()
+    if reaped:
+        print(f"Marked {len(reaped)} abandoned job(s) as failed: {', '.join(reaped)}")
+
     queue = Queue("firmware_upgrades", connection=redis_conn)
     worker = SimpleWorker([queue], connection=redis_conn)
     print("Worker started, listening on queue: firmware_upgrades")

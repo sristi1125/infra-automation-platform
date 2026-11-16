@@ -9,3 +9,6 @@ orchestrator/chaos.json
 orchestrator/firmware.json
 jobs.db
 firmware.json
+
+# Redis snapshot (local runtime data)
+dump.rdb
