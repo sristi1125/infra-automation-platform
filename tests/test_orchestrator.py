@@ -70,14 +70,10 @@ class AuthedClient:
 
 
 @pytest.fixture
-def orchestrator_client(run_simulator):
-    """Flask test client for the orchestrator, pointed at the test simulator."""
+def orchestrator_client(run_simulator, clean_state):
+    """Flask test client for the orchestrator, pointed at the test simulator.
+    clean_state (conftest.py) gives each test empty tables and Redis."""
     os.environ["SIMULATOR_URL"] = SIMULATOR_TEST_URL
-
-    import jobs
-    import audit
-    jobs.init_db()
-    audit.init_db()
 
     import app as orchestrator_app
     orchestrator_app.device_client.base_url = SIMULATOR_TEST_URL
